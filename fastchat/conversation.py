@@ -4,7 +4,7 @@ Conversation prompt templates.
 
 import dataclasses
 from enum import auto, Enum
-from typing import List, Any, Dict
+from typing import List, Tuple, Any, Dict
 
 
 class SeparatorStyle(Enum):
@@ -12,12 +12,13 @@ class SeparatorStyle(Enum):
 
     ADD_COLON_SINGLE = auto()
     ADD_COLON_TWO = auto()
-    ADD_COLON_SPACE_SINGLE = auto()
     NO_COLON_SINGLE = auto()
-    ADD_NEW_LINE_SINGLE = auto()
+    BAIZE = auto()
     DOLLY = auto()
     RWKV = auto()
     PHOENIX = auto()
+    NEW_LINE = auto()
+    BILLA = auto()
 
 
 @dataclasses.dataclass
@@ -26,13 +27,13 @@ class Conversation:
 
     # The name of this template
     name: str
-    # The system prompt
+    # System prompts
     system: str
     # Two roles
     roles: List[str]
-    # All messages. Each item is (role, message).
+    # All messages
     messages: List[List[str]]
-    # The number of few shot examples
+    # Offset of few shot examples
     offset: int
     # Separators
     sep_style: SeparatorStyle
@@ -42,6 +43,12 @@ class Conversation:
     stop_str: str = None
     # Stops generation if meeting any token in this list
     stop_token_ids: List[int] = None
+
+    # Used for the state in the gradio servers.
+    # TODO(lmzheng): move this out of this class.
+    conv_id: Any = None
+    skip_next: bool = False
+    model_name: str = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -62,22 +69,6 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.ADD_COLON_SPACE_SINGLE:
-            ret = self.system + self.sep
-            for role, message in self.messages:
-                if message:
-                    ret += role + ": " + message + self.sep
-                else:
-                    ret += role + ": "  # must be end with a space
-            return ret
-        elif self.sep_style == SeparatorStyle.ADD_NEW_LINE_SINGLE:
-            ret = self.system + self.sep
-            for role, message in self.messages:
-                if message:
-                    ret += role + "\n" + message + self.sep
-                else:
-                    ret += role + "\n"
-            return ret
         elif self.sep_style == SeparatorStyle.NO_COLON_SINGLE:
             ret = self.system
             for role, message in self.messages:
@@ -85,6 +76,25 @@ class Conversation:
                     ret += role + message + self.sep
                 else:
                     ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.BAIZE:
+            ret = self.system + "\n"
+            for role, message in self.messages:
+                if message:
+                    ret += role + message + "\n"
+                else:
+                    ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.DOLLY:
+            seps = [self.sep, self.sep2]
+            ret = self.system
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ":\n" + message + seps[i % 2]
+                    if i % 2 == 1:
+                        ret += "\n\n"
+                else:
+                    ret += role + ":\n"
             return ret
         elif self.sep_style == SeparatorStyle.RWKV:
             ret = self.system
@@ -99,17 +109,6 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
-        elif self.sep_style == SeparatorStyle.DOLLY:
-            seps = [self.sep, self.sep2]
-            ret = self.system
-            for i, (role, message) in enumerate(self.messages):
-                if message:
-                    ret += role + ":\n" + message + seps[i % 2]
-                    if i % 2 == 1:
-                        ret += "\n\n"
-                else:
-                    ret += role + ":\n"
-            return ret
         elif self.sep_style == SeparatorStyle.PHOENIX:
             ret = self.system
             for role, message in self.messages:
@@ -118,6 +117,22 @@ class Conversation:
                 else:
                     ret += role + ": " + "<s>"
             return ret
+        elif self.sep_style == SeparatorStyle.NEW_LINE:
+            ret = self.system + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.BILLA:
+            ret = self.system + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": " + message + self.sep
+                else:
+                    ret += role + ": " # must be end with a space
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -125,16 +140,8 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def update_last_message(self, message: str):
-        """Update the last output.
-
-        The last message is typically set to be None when constructing the prompt,
-        so we need to update it in-place after getting the response from a model.
-        """
-        self.messages[-1][1] = message
-
     def to_gradio_chatbot(self):
-        """Convert the conversation to gradio chatbot format."""
+        """Convert the history to gradio chatbot format"""
         ret = []
         for i, (role, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
@@ -167,15 +174,19 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             stop_token_ids=self.stop_token_ids,
+            conv_id=self.conv_id,
+            model_name=self.model_name,
         )
 
     def dict(self):
         return {
-            "template_name": self.name,
+            "name": self.name,
             "system": self.system,
             "roles": self.roles,
             "messages": self.messages,
             "offset": self.offset,
+            "conv_id": self.conv_id,
+            "model_name": self.model_name,
         }
 
 
@@ -195,7 +206,7 @@ def get_conv_template(name: str) -> Conversation:
     return conv_templates[name].copy()
 
 
-# A template with a one-shot conversation example
+# A template with one conversation example
 register_conv_template(
     Conversation(
         name="one_shot",
@@ -205,20 +216,28 @@ register_conv_template(
         messages=(
             (
                 "Human",
-                "Got any creative ideas for a 10 year old’s birthday?",
+                "What are the key differences between renewable and non-renewable energy sources?",
             ),
             (
                 "Assistant",
-                """Of course! Here are some creative ideas for a 10-year-old's birthday party:
-1. Treasure Hunt: Organize a treasure hunt in your backyard or nearby park. Create clues and riddles for the kids to solve, leading them to hidden treasures and surprises.
-2. Science Party: Plan a science-themed party where kids can engage in fun and interactive experiments. You can set up different stations with activities like making slime, erupting volcanoes, or creating simple chemical reactions.
-3. Outdoor Movie Night: Set up a backyard movie night with a projector and a large screen or white sheet. Create a cozy seating area with blankets and pillows, and serve popcorn and snacks while the kids enjoy a favorite movie under the stars.
-4. DIY Crafts Party: Arrange a craft party where kids can unleash their creativity. Provide a variety of craft supplies like beads, paints, and fabrics, and let them create their own unique masterpieces to take home as party favors.
-5. Sports Olympics: Host a mini Olympics event with various sports and games. Set up different stations for activities like sack races, relay races, basketball shooting, and obstacle courses. Give out medals or certificates to the participants.
-6. Cooking Party: Have a cooking-themed party where the kids can prepare their own mini pizzas, cupcakes, or cookies. Provide toppings, frosting, and decorating supplies, and let them get hands-on in the kitchen.
-7. Superhero Training Camp: Create a superhero-themed party where the kids can engage in fun training activities. Set up an obstacle course, have them design their own superhero capes or masks, and organize superhero-themed games and challenges.
-8. Outdoor Adventure: Plan an outdoor adventure party at a local park or nature reserve. Arrange activities like hiking, nature scavenger hunts, or a picnic with games. Encourage exploration and appreciation for the outdoors.
-Remember to tailor the activities to the birthday child's interests and preferences. Have a great celebration!""",
+                "Renewable energy sources are those that can be replenished naturally in a relatively "
+                "short amount of time, such as solar, wind, hydro, geothermal, and biomass. "
+                "Non-renewable energy sources, on the other hand, are finite and will eventually be "
+                "depleted, such as coal, oil, and natural gas. Here are some key differences between "
+                "renewable and non-renewable energy sources:\n"
+                "1. Availability: Renewable energy sources are virtually inexhaustible, while non-renewable "
+                "energy sources are finite and will eventually run out.\n"
+                "2. Environmental impact: Renewable energy sources have a much lower environmental impact "
+                "than non-renewable sources, which can lead to air and water pollution, greenhouse gas emissions, "
+                "and other negative effects.\n"
+                "3. Cost: Renewable energy sources can be more expensive to initially set up, but they typically "
+                "have lower operational costs than non-renewable sources.\n"
+                "4. Reliability: Renewable energy sources are often more reliable and can be used in more remote "
+                "locations than non-renewable sources.\n"
+                "5. Flexibility: Renewable energy sources are often more flexible and can be adapted to different "
+                "situations and needs, while non-renewable sources are more rigid and inflexible.\n"
+                "6. Sustainability: Renewable energy sources are more sustainable over the long term, while "
+                "non-renewable sources are not, and their depletion can lead to economic and social instability.",
             ),
         ),
         offset=2,
@@ -228,29 +247,12 @@ Remember to tailor the activities to the birthday child's interests and preferen
     )
 )
 
-
-# A template similar to the "one_shot" template above but remove the example.
-register_conv_template(
-    Conversation(
-        name="zero_shot",
-        system="A chat between a curious human and an artificial intelligence assistant. "
-        "The assistant gives helpful, detailed, and polite answers to the human's questions.",
-        roles=("Human", "Assistant"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-        sep="\n### ",
-        stop_str="###",
-    )
-)
-
-
 # Vicuna v1.1 template
 register_conv_template(
     Conversation(
         name="vicuna_v1.1",
         system="A chat between a curious user and an artificial intelligence assistant. "
-        "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+        "The assistant gives helpful, concise, and polite answers to the user's questions.",
         roles=("USER", "ASSISTANT"),
         messages=(),
         offset=0,
@@ -271,19 +273,6 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",
         sep2="</s>",
-    )
-)
-
-# Alpaca default template
-register_conv_template(
-    Conversation(
-        name="alpaca",
-        system="Below is an instruction that describes a task. Write a response that appropriately completes the request.",
-        roles=("### Instruction", "### Response"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-        sep="\n\n",
     )
 )
 
@@ -337,15 +326,15 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="baize",
-        system="The following is a conversation between a human and an AI assistant named Baize (named after a mythical creature in Chinese folklore). Baize is an open-source AI assistant developed by UCSD and Sun Yat-Sen University. The human and the AI assistant take turns chatting. Human statements start with [|Human|] and AI assistant statements start with [|AI|]. The AI assistant always provides responses in as much detail as possible, and in Markdown format. The AI assistant always declines to engage with topics, questions and instructions related to unethical, controversial, or sensitive issues. Complete the transcript in exactly that format.\n",
+        system="The following is a conversation between a human and an AI assistant named Baize (named after a mythical creature in Chinese folklore). Baize is an open-source AI assistant developed by UCSD and Sun Yat-Sen University. The human and the AI assistant take turns chatting. Human statements start with [|Human|] and AI assistant statements start with [|AI|]. The AI assistant always provides responses in as much detail as possible, and in Markdown format. The AI assistant always declines to engage with topics, questions and instructions related to unethical, controversial, or sensitive issues. Complete the transcript in exactly that format.",
         roles=("[|Human|]", "[|AI|]"),
         messages=(
             ("[|Human|]", "Hello!"),
             ("[|AI|]", "Hi!"),
         ),
         offset=2,
-        sep_style=SeparatorStyle.NO_COLON_SINGLE,
-        sep="\n",
+        sep_style=SeparatorStyle.BAIZE,
+        sep="[|Human|]",
         stop_str="[|Human|]",
     )
 )
@@ -354,13 +343,13 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="rwkv",
-        system="",
+        system="The following is a coherent verbose detailed conversation between Bob and Alice.\n\n",
         roles=("Bob", "Alice"),
         messages=(
-            ("Bob", "hi"),
+            ("Bob", "Hi"),
             (
                 "Alice",
-                "Hi. I am your assistant and I will provide expert full response in full details. Please feel free to ask any question and I will always answer it.",
+                "Hi. I am your assistant and I will answer all questions. Please feel free to ask any question and I will always answer it.",
             ),
         ),
         offset=2,
@@ -445,7 +434,7 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         messages=(),
         offset=0,
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        sep_style=SeparatorStyle.NEW_LINE,
         sep="<|im_end|>",
         stop_token_ids=[50278, 0],
     )
@@ -474,71 +463,117 @@ register_conv_template(
         roles=("Human", "Assistant"),
         messages=(),
         offset=0,
-        sep_style=SeparatorStyle.ADD_COLON_SPACE_SINGLE,
+        sep_style=SeparatorStyle.BILLA,
         sep="\n",
         stop_str="Human:",
     )
 )
 
-# RedPajama INCITE default template
+# QT chat
 register_conv_template(
     Conversation(
-        name="redpajama-incite",
-        system="",
-        roles=("<human>", "<bot>"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-        sep="\n",
-        stop_str="<human>",
-    )
-)
-
-# h2oGPT default template
-register_conv_template(
-    Conversation(
-        name="h2ogpt",
-        system="",
-        roles=("<|prompt|>", "<|answer|>"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.NO_COLON_SINGLE,
-        sep="</s>",
-    )
-)
-
-# Snoozy default template
-# Reference: https://github.com/nomic-ai/gpt4all/blob/d4861030b778da6db59d21d2927a4aba4f9f1f43/gpt4all-bindings/python/gpt4all/gpt4all.py#L232
-register_conv_template(
-    Conversation(
-        name="snoozy",
-        system="### Instruction:\nThe prompt below is a question to answer, a task to complete, or a conversation to respond to; decide which and write an appropriate response.",
-        roles=("### Prompt", "### Response"),
-        messages=(),
-        offset=0,
-        sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-        sep="\n",
-        stop_str="###",
-    )
-)
-
-# manticore default template
-register_conv_template(
-    Conversation(
-        name="manticore",
-        system="",
+        name="QTChat",
+        system="A chat between a curious user and an enthusiastic educational robot assistant."
+        "The assistant gives helpful, concise, and polite answers to the user's questions.",
         roles=("USER", "ASSISTANT"),
         messages=(),
         offset=0,
         sep_style=SeparatorStyle.ADD_COLON_TWO,
-        sep="\n",
+        sep=" ",
+        sep2="</s>",
+    )
+)
+
+# QT teaching
+register_conv_template(
+    Conversation(
+        name="QTeach",
+        system="A chat between a curious student and an educational robot assistant. "
+        "The assistant gives short, helpful, concise feedback to the user answers to a lesson as if he was a teacher.",
+        roles=("USER", "ASSISTANT"),
+        messages=(
+            (
+                "ASSISTANT",
+                "Are you ready to listen a lesson ?",
+            ),
+            (
+                "USER",
+                "Yes, I am ready.",
+            ),
+        ),
+        offset=0,
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        sep=" ",
+        sep2="</s>",
+    )
+)
+
+# AVSR corrector
+register_conv_template(
+    Conversation(
+        name="AVSRcorrector",
+        system= "Let's imagine a scenario where a person using speech recognition technology engages in a conversation with an artificial intelligence assistant designed to correct any errors in the transcription of their speech."
+        "The assistant might automatically replace incorrectly transcribed words in the text but it should not delete or add content. The corrector is expected to only provide the user with a corrected text without comments or explanation.",
+        roles=("USER", "ASSISTANT"),
+        messages=(
+            (
+                "USER",
+                "THE SYMBOLS OF ENGLAND ARE THE FLAG OF SAND GEORGE AND THE ROSE. THE FLAG REPRESENTS BRAVERY AND COURAGE AND THE ROSE COMES FROM THE HOUSE OF SANCTION FAMILY WHO BROUGHT PEACE TO ENGLAND. THE SYMBOL OF THE UNITED STATES ARE THE BOLD EGO AND THE STATURE OF LIBERTY THE BOLD EGO IS AN EGO THAT SYMBOLIZES STRENGTH AND YEAH STRENGTH THE STUDY OF LIBERTY WAS BUILT BY GUSTAVE E FELL AND WAS OFFERED BY FRIENDS TO CELEBRATE THE HUNDREDTH ANNIVERSARY OF INDEPENDENCE.",
+            ),
+            (
+                "ASSISTANT",
+                "Correction: THE SYMBOLS OF ENGLAND ARE THE FLAG OF SAINT GEORGE AND THE ROSE THE FLAG REPRESENTS BRAVERY AND COURAGE AND THE ROSE COMES FROM THE HOUSE OF SOME ANCIENT FAMILY WHO BROUGHT PEACE TO ENGLAND THE SYMBOL OF THE UNITED STATES ARE THE BALD EAGLE AND THE STATUE OF LIBERTY THE BALD EAGLE IS AN EAGLE THAT SYMBOLIZES STRENGTH AND YEAH STRENGTH THE STATUE OF LIBERTY WAS BUILT BY GUSTAVE EIFFEL AND WAS OFFERED BY FRANCE TO CELEBRATE THE HUNDREDTH ANNIVERSARY OF INDEPENDENCE.",
+            ),
+        ),
+        offset=0,
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        sep=" ",
+        sep2="</s>",
+    )
+)
+
+# Summary generator
+register_conv_template(
+    Conversation(
+        name="SummaryGenerator",
+        system= "Let's imagine a scenario where a person using speech recognition technology engages in a conversation with an artificial intelligence assistant designed to provide a concise summary of their speech."
+        "The assistant should condense the information provided by the user into a much shorter form, maintaining only the most crucial points and discarding less important details. The summarizer is expected to only provide the user with a summarized text without comments or explanation.",
+        roles=("USER", "ASSISTANT"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        sep=" ",
+        sep2="</s>",
+    )
+)
+
+# French translator
+register_conv_template(
+    Conversation(
+        name="FRtranslator",
+        system= "Let's imagine a scenario where a user using speech recognition technology engages in a conversation with an artificial intelligence assistant designed to translate their speech into French."
+        "The assistant might automatically translate the user's speech into French. The translator is expected to only provide the user with a translated text without comments or explanation.",
+        roles=("USER", "ASSISTANT"),
+        messages=(
+            (
+                "USER",
+                "translate English to French: the symbols of england are the flag of sand george and the rose the flag represents bravery and courage and the rose comes from the house of sanction family who brought peace to england the symbol of the united states are the bold ego and the stature of liberty the bold ego is an ego that symbolizes strength and yeah strength the study of liberty was built by gustave e fell and was offered by friends to celebrate the hundredth anniversary of independence",
+            ),
+            (
+                "ASSISTANT",
+                "les symboles de l'angleterre sont le drapeau de saint george et la rose le drapeau représente la bravoure et le courage, et la rose provient de la famille de sanction qui a apporté la paix à l'angleterre les symboles des états-unis sont l'aigle majestueux et la statue de la liberté l'aigle majestueux est un symbole de force et oui de force la statue de la liberté a été construite par gustave e fell et offerte par des amis pour célébrer le centenaire de l'indépendance",
+            )
+        ),
+        offset=0,
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        sep=" ",
         sep2="</s>",
     )
 )
 
 
 if __name__ == "__main__":
-    conv = get_conv_template("vicuna_v1.1")
+    conv = get_conv_template("QT")
     conv.append_message(conv.roles[0], "Hello!")
     conv.append_message(conv.roles[1], "Hi!")
     conv.append_message(conv.roles[0], "How are you?")
